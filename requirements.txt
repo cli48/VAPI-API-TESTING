@@ -1,7 +1,9 @@
 Flask==3.0.3
 Flask-Cors==4.0.1
 
-psycopg[binary]==3.2.1
+psycopg[binary]
+
+
 SQLAlchemy==2.0.25
 
 python-dotenv==1.0.1
