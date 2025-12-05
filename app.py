@@ -1,17 +1,26 @@
-import os
-from flask import Flask, jsonify
-from flask_cors import CORS
+# app.py
+from flask import Flask
+from dotenv import load_dotenv
 
-app = Flask(__name__)
+load_dotenv()
 
-# Enable CORS so VAPI dashboard tests work (browser-based)
-CORS(app)
+# Import blueprints
+from routes.health import health_bp
+from routes.submit_call import submit_call_bp
+from routes.contacts import contacts_bp 
 
-@app.route("/hello", methods=["GET"])
-def hello():
-    return jsonify({"message": "Hello World"}), 200
+def create_app():
+    app = Flask(__name__)
+
+    # Register all endpoints
+    app.register_blueprint(health_bp)
+    app.register_blueprint(submit_call_bp)
+    app.register_blueprint(contacts_bp)
+
+    return app
+
+
+app = create_app()
 
 if __name__ == "__main__":
-    # Render requires your app to listen on the port it provides
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000, debug=True)

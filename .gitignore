@@ -1,0 +1,23 @@
+# Python build files
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+env/
+
+# OS files
+.DS_Store
+
+# VS Code settings
+.vscode/
+
+# Render build logs
+render.yaml
+
+# Keys, secrets, configs (if any)
+*.env
+.env*
+scgena.sql
+db_test.py
+
