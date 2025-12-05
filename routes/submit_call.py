@@ -1,13 +1,12 @@
 # routes/submit_call.py
 import os
 from flask import Blueprint, request, jsonify
-from psycopg2.extras import Json
+from psycopg.types.json import Jsonb  # NEW: psycopg3 JSONB wrapper
 
 from db import get_db_connection
 
 submit_call_bp = Blueprint("submit_call", __name__)
 
-# Allowed enum values (must match your DB)
 VALID_PURPOSES = {"booking", "reschedule", "cancel", "pricing", "general"}
 VALID_ACTIONS = {"created_booking", "rescheduled", "cancelled", "none"}
 
@@ -19,9 +18,7 @@ def submit_call():
     Secured with a Bearer API key.
     """
 
-    # --------------------------
-    # 1. Validate API key
-    # --------------------------
+    # 1) API key auth
     expected_key = os.environ.get("API_KEY_SECRET")
     auth_header = request.headers.get("Authorization")
 
@@ -32,13 +29,10 @@ def submit_call():
         return jsonify({"error": "Missing Authorization header"}), 401
 
     token = auth_header.replace("Bearer ", "").strip()
-
     if token != expected_key:
         return jsonify({"error": "Invalid API key"}), 401
 
-    # --------------------------
-    # 2. Parse and validate JSON
-    # --------------------------
+    # 2) Parse JSON
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
@@ -58,16 +52,11 @@ def submit_call():
     purpose = data.get("purpose", "general")
     action = data.get("action", "none")
 
-    # Validate ENUMs before database error happens
     if purpose not in VALID_PURPOSES:
         return jsonify({"error": f"Invalid purpose '{purpose}'"}), 400
-
     if action not in VALID_ACTIONS:
         return jsonify({"error": f"Invalid action '{action}'"}), 400
 
-    # --------------------------
-    # 3. Insert into database
-    # --------------------------
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -84,22 +73,22 @@ def submit_call():
             """,
             (phone_number, first_name),
         )
+        contact_row = cur.fetchone()
+        contact_id = contact_row["id"] if isinstance(contact_row, dict) else contact_row[0]
 
-        contact_id = cur.fetchone()[0]
-
-        # Insert call log
+        # Insert call
         cur.execute(
             """
-            INSERT INTO calls 
+            INSERT INTO calls
                 (phone_number, direction, summary, metadata, purpose, action)
             VALUES
                 (%s, %s, %s, %s, %s, %s)
             RETURNING id;
             """,
-            (phone_number, direction, summary, Json(metadata), purpose, action),
+            (phone_number, direction, summary, Jsonb(metadata), purpose, action),
         )
-
-        call_id = cur.fetchone()[0]
+        call_row = cur.fetchone()
+        call_id = call_row["id"] if isinstance(call_row, dict) else call_row[0]
 
         conn.commit()
         cur.close()
@@ -112,4 +101,5 @@ def submit_call():
         }), 201
 
     except Exception as e:
+        # In production you’d log this instead of returning raw error
         return jsonify({"error": str(e)}), 500

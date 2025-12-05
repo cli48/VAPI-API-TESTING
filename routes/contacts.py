@@ -21,14 +21,8 @@ def upsert_contact():
       "last_name": "Li",                  # optional
       "email": "calvin@example.com"       # optional
     }
-
-    Behavior:
-    - If contact doesn't exist -> insert.
-    - If contact exists -> update ONLY fields that are currently NULL.
-      (i.e., don't overwrite existing values unless the DB has NULL)
     """
 
-    # 1) API key auth
     expected_key = os.environ.get("API_KEY_SECRET")
     auth_header = request.headers.get("Authorization")
 
@@ -42,7 +36,6 @@ def upsert_contact():
     if token != expected_key:
         return jsonify({"error": "Invalid API key"}), 401
 
-    # 2) Parse JSON
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
@@ -59,10 +52,6 @@ def upsert_contact():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Upsert contact:
-        # - If contact doesn't exist -> insert values.
-        # - If contact exists -> only fill NULL fields,
-        #   keep existing non-NULL values.
         cur.execute(
             """
             INSERT INTO contacts (phone_number, first_name, last_name, email)
@@ -82,13 +71,23 @@ def upsert_contact():
         cur.close()
         conn.close()
 
-        contact = {
-            "id": row[0],
-            "phone_number": row[1],
-            "first_name": row[2],
-            "last_name": row[3],
-            "email": row[4],
-        }
+        # dict_row from db.py will make 'row' a dict
+        if isinstance(row, dict):
+            contact = {
+                "id": row["id"],
+                "phone_number": row["phone_number"],
+                "first_name": row["first_name"],
+                "last_name": row["last_name"],
+                "email": row["email"],
+            }
+        else:
+            contact = {
+                "id": row[0],
+                "phone_number": row[1],
+                "first_name": row[2],
+                "last_name": row[3],
+                "email": row[4],
+            }
 
         return jsonify({
             "status": "success",
