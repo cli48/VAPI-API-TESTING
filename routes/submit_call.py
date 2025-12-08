@@ -1,28 +1,47 @@
 # routes/submit_call.py
 import os
-import json
-from flask import Blueprint, request, jsonify
-from psycopg.types.json import Jsonb  # psycopg3 JSONB wrapper
+from flask import Blueprint, request, jsonify, current_app
+from psycopg.types.json import Jsonb
 
 from db import get_db_connection
 
 submit_call_bp = Blueprint("submit_call", __name__)
 
-# Adjust these to match what your agent actually uses
-VALID_PURPOSES = {"booking", "reschedule", "cancel", "pricing", "general"}
-VALID_ACTIONS = {"created_booking", "rescheduled", "cancelled", "none"}
-
-
 @submit_call_bp.route("/submit_call", methods=["POST"])
 def submit_call():
     """
-    Endpoint for Vapi AI agent to log call data.
-    Secured with a Bearer API key.
-    Expects Vapi tool payload:
-      body.message.toolCallList[0].function.arguments
+    Vapi end-of-call-report webhook.
+
+    Expects a body like the sample you captured from Postman:
+    {
+      "message": {
+        "type": "end-of-call-report",
+        "analysis": {
+          "summary": "...",
+          "structuredData": {
+            "phone_number": "+10000000000",
+            "direction": "inbound",
+            "first_name": "Calvin",
+            "summary": "User Calvin ...",
+            "metadata": { "ended_reason": "assistant-ended-call" },
+            "purpose": "unclear",
+            "action": "none"
+          },
+          ...
+        },
+        "startedAt": "...",
+        "endedAt": "...",
+        "endedReason": "assistant-ended-call",
+        "summary": "...",
+        "transcript": "...",
+        "recordingUrl": "...",
+        "call": { "id": "..." },
+        ...
+      }
+    }
     """
 
-    # 1) API key auth -----------------------------------------
+    # 1) API key auth
     expected_key = os.environ.get("API_KEY_SECRET")
     auth_header = request.headers.get("Authorization")
 
@@ -36,111 +55,108 @@ def submit_call():
     if token != expected_key:
         return jsonify({"error": "Invalid API key"}), 403
 
-    # 2) Parse Vapi payload ------------------------------------
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"error": "Invalid or missing JSON body"}), 400
+    # 2) Parse JSON
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "Invalid or missing JSON"}), 400
 
-    try:
-        tool_call = payload["message"]["toolCallList"][0]
-        tool_call_id = tool_call["id"]
-        raw_args = tool_call["function"]["arguments"]
-    except (KeyError, IndexError, TypeError):
-        return jsonify({"error": "Malformed Vapi tool payload"}), 400
+    message = data.get("message") or {}
+    msg_type = message.get("type")
 
-    # arguments might be an object or a JSON string
-    if isinstance(raw_args, str):
-        try:
-            args = json.loads(raw_args)
-        except json.JSONDecodeError:
-            return jsonify({"error": "Could not parse tool arguments JSON"}), 400
-    else:
-        args = raw_args or {}
+    # Only handle end-of-call-report
+    if msg_type != "end-of-call-report":
+        current_app.logger.info(f"/submit_call: ignoring message.type=%r", msg_type)
+        return jsonify({"status": "ignored", "reason": f"message.type={msg_type}"}), 200
 
-    # 3) Extract fields from arguments -------------------------
-    phone_number = args.get("phone_number")
-    direction = args.get("direction")          # "inbound" / "outbound"
-    purpose = args.get("purpose")              # should be in VALID_PURPOSES
-    action = args.get("action")                # should be in VALID_ACTIONS
-    summary = args.get("summary")
-    transcript = args.get("transcript")
-    metadata = args.get("metadata") or {}      # free-form JSON (dict)
+    # 3) Extract fields from analysis.structuredData
+    analysis = message.get("analysis") or {}
+    structured = analysis.get("structuredData") or {}
 
-    # Optional timestamps / duration if you send them
-    started_at = args.get("started_at")        # ISO 8601 string or None
-    ended_at = args.get("ended_at")
-    duration_seconds = args.get("duration_seconds")
+    phone_number = structured.get("phone_number")
+    direction = structured.get("direction")
+    first_name = structured.get("first_name")
+    purpose = structured.get("purpose")
+    action = structured.get("action")
+    metadata = structured.get("metadata") or {}
 
-    # 4) Basic validation --------------------------------------
-    if not phone_number:
-        return jsonify({"error": "phone_number is required"}), 400
+    # Prefer structured summary, fall back to top-level summary
+    summary = structured.get("summary") or message.get("summary")
 
-    if purpose and purpose not in VALID_PURPOSES:
-        return jsonify(
-            {"error": f"Invalid purpose '{purpose}'. Must be one of {sorted(VALID_PURPOSES)}"}
-        ), 400
+    # 4) Extract other call-level fields
+    call = message.get("call") or {}
+    vapi_call_id = call.get("id")
 
-    if action and action not in VALID_ACTIONS:
-        return jsonify(
-            {"error": f"Invalid action '{action}'. Must be one of {sorted(VALID_ACTIONS)}"}
-        ), 400
+    call_started = message.get("startedAt")
+    call_ended = message.get("endedAt")
+    ended_reason = message.get("endedReason")
 
-    # 5) Insert into Postgres ----------------------------------
+    transcript = message.get("transcript")
+    recording_url = message.get("recordingUrl")
+
+    # Basic sanity log
+    current_app.logger.info(
+        "Saving call: vapi_call_id=%s phone=%s direction=%s",
+        vapi_call_id,
+        phone_number,
+        direction,
+    )
+
+    # 5) Insert into DB
     conn = get_db_connection()
-
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO calls
-                        (phone_number,
-                         direction,
-                         purpose,
-                         action,
-                         metadata,
-                         summary,
-                         transcript,
-                         started_at,
-                         ended_at,
-                         duration_seconds)
-                    VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id;
-                    """,
-                    (
+                    INSERT INTO calls (
+                        vapi_call_id,
                         phone_number,
                         direction,
+                        first_name,
                         purpose,
                         action,
-                        Jsonb(metadata),
                         summary,
                         transcript,
-                        started_at,
-                        ended_at,
-                        duration_seconds,
+                        recording_url,
+                        ended_reason,
+                        metadata,
+                        call_started,
+                        call_ended
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (vapi_call_id) DO UPDATE
+                    SET
+                        phone_number   = EXCLUDED.phone_number,
+                        direction      = EXCLUDED.direction,
+                        first_name     = EXCLUDED.first_name,
+                        purpose        = EXCLUDED.purpose,
+                        action         = EXCLUDED.action,
+                        summary        = EXCLUDED.summary,
+                        transcript     = EXCLUDED.transcript,
+                        recording_url  = EXCLUDED.recording_url,
+                        ended_reason   = EXCLUDED.ended_reason,
+                        metadata       = EXCLUDED.metadata,
+                        call_started   = EXCLUDED.call_started,
+                        call_ended     = EXCLUDED.call_ended
+                    """,
+                    (
+                        vapi_call_id,
+                        phone_number,
+                        direction,
+                        first_name,
+                        purpose,
+                        action,
+                        summary,
+                        transcript,
+                        recording_url,
+                        ended_reason,
+                        Jsonb(metadata),
+                        call_started,
+                        call_ended,
                     ),
                 )
-                call_id = cur.fetchone()[0]
-
     except Exception as e:
-        # Log e in real app
-        return jsonify({"error": "Database insert failed", "details": str(e)}), 500
-    finally:
-        conn.close()
+        current_app.logger.exception("Error saving call from Vapi")
+        return jsonify({"error": "Database error"}), 500
 
-    # 6) Respond in Vapi's expected format ---------------------
-    return jsonify(
-        {
-            "results": [
-                {
-                    "toolCallId": tool_call_id,
-                    "result": {
-                        "status": "ok",
-                        "call_id": call_id,
-                        "phone_number": phone_number,
-                    },
-                }
-            ]
-        }
-    ), 200
+    return jsonify({"status": "ok"}), 200
