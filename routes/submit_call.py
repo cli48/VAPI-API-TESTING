@@ -1,7 +1,7 @@
-# routes/submit_call.py
 import os
+import json
 from flask import Blueprint, request, jsonify
-from psycopg.types.json import Jsonb  # NEW: psycopg3 JSONB wrapper
+from psycopg.types.json import Jsonb  # if you're using this already
 
 from db import get_db_connection
 
@@ -13,11 +13,6 @@ VALID_ACTIONS = {"created_booking", "rescheduled", "cancelled", "none"}
 
 @submit_call_bp.route("/submit_call", methods=["POST"])
 def submit_call():
-    """
-    Endpoint for VAPI AI agent to log call data.
-    Secured with a Bearer API key.
-    """
-
     # 1) API key auth
     expected_key = os.environ.get("API_KEY_SECRET")
     auth_header = request.headers.get("Authorization")
@@ -32,74 +27,115 @@ def submit_call():
     if token != expected_key:
         return jsonify({"error": "Invalid API key"}), 401
 
-    # 2) Parse JSON
+    # 2) Parse Vapi envelope
     data = request.get_json(silent=True)
     if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
+        return jsonify({"error": "Missing JSON body"}), 400
 
-    required = ["phone_number", "direction"]
-    missing = [f for f in required if f not in data]
+    # Debug (TEMPORARY – super helpful right now)
+    print("RAW VAPI PAYLOAD:", json.dumps(data, indent=2))
 
+    message = data.get("message") or {}
+    tool_calls = message.get("toolCallList") or []
+    if not tool_calls:
+        return jsonify({"error": "No toolCallList provided"}), 400
+
+    tool_call = tool_calls[0]
+    tool_call_id = tool_call.get("id")
+    function = tool_call.get("function") or {}
+    raw_args = function.get("arguments")
+
+    # 3) arguments may be a JSON string or an object
+    if isinstance(raw_args, str):
+        try:
+            args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return jsonify({"error": "Invalid JSON in function.arguments"}), 400
+    elif isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        return jsonify({"error": "function.arguments must be object or JSON string"}), 400
+
+    # Debug
+    print("EXTRACTED ARGS:", json.dumps(args, indent=2))
+
+    # 4) Extract your actual call fields from args
+    call_id = args.get("call_id")
+    phone_number = args.get("phone_number")
+    direction = args.get("direction")  # inbound / outbound
+    purpose = args.get("purpose")
+    action_taken = args.get("action_taken")
+    summary = args.get("summary")
+    started_at = args.get("started_at")
+    ended_at = args.get("ended_at")
+    transcript = args.get("transcript")
+    metadata = args.get("metadata") or {}
+
+    # 5) Basic validation
+    missing = [f for f in ["call_id", "phone_number", "direction"] if not args.get(f)]
     if missing:
         return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
 
-    phone_number = data["phone_number"]
-    direction = data["direction"]
-    first_name = data.get("first_name")
-    summary = data.get("summary")
-    metadata = data.get("metadata") or {}
+    if purpose and purpose not in VALID_PURPOSES:
+        return jsonify({"error": f"Invalid purpose: {purpose}"}), 400
 
-    purpose = data.get("purpose", "general")
-    action = data.get("action", "none")
+    if action_taken and action_taken not in VALID_ACTIONS:
+        return jsonify({"error": f"Invalid action_taken: {action_taken}"}), 400
 
-    if purpose not in VALID_PURPOSES:
-        return jsonify({"error": f"Invalid purpose '{purpose}'"}), 400
-    if action not in VALID_ACTIONS:
-        return jsonify({"error": f"Invalid action '{action}'"}), 400
+    # 6) Save to database (example – adjust to your schema)
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Upsert contact
-        cur.execute(
-            """
-            INSERT INTO contacts (phone_number, first_name)
-            VALUES (%s, %s)
-            ON CONFLICT (phone_number)
-            DO UPDATE SET first_name =
-                COALESCE(EXCLUDED.first_name, contacts.first_name)
-            RETURNING id;
-            """,
-            (phone_number, first_name),
+    # Example insert – change columns/table names to match your DB
+    cur.execute(
+        """
+        INSERT INTO calls (
+            call_id,
+            phone_number,
+            direction,
+            purpose,
+            action_taken,
+            summary,
+            started_at,
+            ended_at,
+            transcript,
+            metadata
         )
-        contact_row = cur.fetchone()
-        contact_id = contact_row["id"] if isinstance(contact_row, dict) else contact_row[0]
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            call_id,
+            phone_number,
+            direction,
+            purpose,
+            action_taken,
+            summary,
+            started_at,
+            ended_at,
+            Jsonb(transcript) if transcript is not None else None,
+            Jsonb(metadata),
+        ),
+    )
 
-        # Insert call
-        cur.execute(
-            """
-            INSERT INTO calls
-                (phone_number, direction, summary, metadata, purpose, action)
-            VALUES
-                (%s, %s, %s, %s, %s, %s)
-            RETURNING id;
-            """,
-            (phone_number, direction, summary, Jsonb(metadata), purpose, action),
-        )
-        call_row = cur.fetchone()
-        call_id = call_row["id"] if isinstance(call_row, dict) else call_row[0]
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
 
-        conn.commit()
-        cur.close()
-        conn.close()
+    saved_id = row[0] if row else None
 
-        return jsonify({
-            "status": "success",
-            "contact_id": contact_id,
-            "call_id": call_id
-        }), 201
-
-    except Exception as e:
-        # In production you’d log this instead of returning raw error
-        return jsonify({"error": str(e)}), 500
+    # 7) Respond in Vapi's expected tool format
+    # (this is what your Express example was doing)
+    return jsonify({
+        "results": [
+            {
+                "toolCallId": tool_call_id,
+                "result": {
+                    "status": "ok",
+                    "saved_db_id": saved_id,
+                    "call_id": call_id,
+                },
+            }
+        ]
+    }), 200
