@@ -2,44 +2,73 @@
 import os
 from flask import Blueprint, request, jsonify, current_app
 from psycopg.types.json import Jsonb
+import requests  # NEW
 
 from db import get_db_connection
 
 submit_call_bp = Blueprint("submit_call", __name__)
 
 
+def fetch_call_summary_from_vapi(call_id: str) -> str | None:
+    """
+    Given a Vapi call ID, fetch the call details from Vapi's API
+    and extract the 'Call Summary' structured output if present.
+    """
+    vapi_api_key = os.environ.get("VAPI_API_KEY")
+    if not vapi_api_key:
+        current_app.logger.warning(
+            "fetch_call_summary_from_vapi: VAPI_API_KEY not set; skipping summary fetch"
+        )
+        return None
+
+    url = f"https://api.vapi.ai/call/{call_id}"
+    headers = {
+        "Authorization": f"Bearer {vapi_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+    except Exception as e:
+        current_app.logger.exception(
+            "fetch_call_summary_from_vapi: error calling Vapi API for call_id=%s", call_id
+        )
+        return None
+
+    if resp.status_code != 200:
+        current_app.logger.warning(
+            "fetch_call_summary_from_vapi: non-200 from Vapi (%s) for call_id=%s",
+            resp.status_code,
+            call_id,
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        current_app.logger.exception(
+            "fetch_call_summary_from_vapi: failed to parse JSON for call_id=%s", call_id
+        )
+        return None
+
+    # The summary lives in data["analysis"]["structuredOutputs"]
+    analysis = data.get("analysis") or {}
+    structured_outputs = analysis.get("structuredOutputs") or {}
+
+    # structured_outputs is a dict keyed by UUID -> { name, result, ... }
+    for so in structured_outputs.values():
+        if not isinstance(so, dict):
+            continue
+        if so.get("name") == "Call Summary":
+            return so.get("result")
+
+    return None
+
+
 @submit_call_bp.route("/submit_call", methods=["POST"])
 def submit_call():
     """
     Vapi webhook for call/tool events.
-
-    Example payload (truncated):
-
-    {
-      "message": {
-        "timestamp": 1765255007055,
-        "type": "tool-calls",
-        "toolCalls": [...],
-        "artifact": {...},
-        "call": {
-          "id": "019b0165-a031-7aa3-a6e7-17b6e1105112",
-          "orgId": "b4d50daf-...",
-          "type": "inboundPhoneCall",
-          "createdAt": "...",
-          "updatedAt": "...",
-          "cost": 0,
-          "transport": { ... },
-          "phoneCallProvider": "vapi",
-          "phoneCallProviderId": "...",
-          "phoneCallTransport": "sip",
-          ...
-        },
-        "phoneNumber": { ... },
-        "customer": { ... },
-        "assistant": { ... },
-        ...
-      }
-    }
 
     We map the important fields into the Calls1 table and keep
     the rest in JSONB for future-proofing.
@@ -106,7 +135,6 @@ def submit_call():
     phone_call_provider_id = call_obj.get("phoneCallProviderId")
 
     # Customer info
-    # Prefer top-level customer, fall back to call.customer if needed
     if not customer_obj:
         customer_obj = call_obj.get("customer") or {}
 
@@ -114,8 +142,11 @@ def submit_call():
     customer_sip_uri = customer_obj.get("sipUri")
 
     # Phone number info
-    # phoneNumberId appears on both top-level and call; prefer top-level
-    phone_number_id = message.get("phoneNumberId") or phone_number_obj.get("id") or call_obj.get("phoneNumberId")
+    phone_number_id = (
+        message.get("phoneNumberId")
+        or phone_number_obj.get("id")
+        or call_obj.get("phoneNumberId")
+    )
     phone_number = phone_number_obj.get("number")
     phone_number_name = phone_number_obj.get("name")
 
@@ -138,7 +169,6 @@ def submit_call():
 
     artifact_messages = artifact_obj.get("messages") or []
     if isinstance(artifact_messages, list):
-        # Walk backwards to find the last user and assistant messages
         for m in reversed(artifact_messages):
             role = m.get("role")
             msg_text = m.get("message")
@@ -149,6 +179,9 @@ def submit_call():
             if last_user_message is not None and last_assistant_message is not None:
                 break
 
+    # 6) Fetch call summary from Vapi (using call_id)
+    call_summary = fetch_call_summary_from_vapi(call_id)
+
     current_app.logger.info(
         "submit_call: saving Calls1 row id=%s event_type=%s customer=%s",
         call_id,
@@ -156,7 +189,7 @@ def submit_call():
         customer_number,
     )
 
-    # 6) Insert into Calls1
+    # 7) Insert into Calls1
     conn = get_db_connection()
     try:
         with conn:
@@ -192,6 +225,7 @@ def submit_call():
                         assistant_voice_provider,
                         last_user_message,
                         last_assistant_message,
+                        call_summary,
                         tool_calls_json,
                         tool_call_list_json,
                         tool_with_tool_call_list_json,
@@ -231,6 +265,7 @@ def submit_call():
                         %(assistant_voice_provider)s,
                         %(last_user_message)s,
                         %(last_assistant_message)s,
+                        %(call_summary)s,
                         %(tool_calls_json)s,
                         %(tool_call_list_json)s,
                         %(tool_with_tool_call_list_json)s,
@@ -270,6 +305,7 @@ def submit_call():
                         assistant_voice_provider = EXCLUDED.assistant_voice_provider,
                         last_user_message        = EXCLUDED.last_user_message,
                         last_assistant_message   = EXCLUDED.last_assistant_message,
+                        call_summary             = EXCLUDED.call_summary,
                         tool_calls_json          = EXCLUDED.tool_calls_json,
                         tool_call_list_json      = EXCLUDED.tool_call_list_json,
                         tool_with_tool_call_list_json = EXCLUDED.tool_with_tool_call_list_json,
@@ -310,6 +346,7 @@ def submit_call():
                         "assistant_voice_provider": assistant_voice_provider,
                         "last_user_message": last_user_message,
                         "last_assistant_message": last_assistant_message,
+                        "call_summary": call_summary,
                         "tool_calls_json": Jsonb(tool_calls),
                         "tool_call_list_json": Jsonb(tool_call_list),
                         "tool_with_tool_call_list_json": Jsonb(tool_with_tool_call_list),
@@ -321,7 +358,7 @@ def submit_call():
                         "raw_payload": Jsonb(message),
                     },
                 )
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("Error saving Calls1 row from Vapi")
         return jsonify({"error": "Database error"}), 500
 
