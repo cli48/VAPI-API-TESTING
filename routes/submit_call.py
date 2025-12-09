@@ -9,18 +9,25 @@ from db import get_db_connection
 submit_call_bp = Blueprint("submit_call", __name__)
 
 
-def fetch_call_summary_from_vapi(call_id: str) -> str | None:
+def fetch_call_summary_from_vapi(call_id: str) -> tuple[str | None, str | None]:
     """
     Given a Vapi call ID, fetch the call details from Vapi's API
     and extract the 'Call Summary' structured output if present.
-    Times out after 10 seconds to avoid blocking the webhook.
+
+    Returns:
+        (summary, debug_info)
+
+        - summary: string if a real summary was found, else None
+        - debug_info: string explaining what went wrong (prefixed with
+          '[DEBUG call_summary]') if any issue occurred, else None
     """
+    debug_prefix = "[DEBUG call_summary]"
     vapi_api_key = os.environ.get("VAPI_API_KEY")
+
     if not vapi_api_key:
-        current_app.logger.warning(
-            "fetch_call_summary_from_vapi: VAPI_API_KEY not set; skipping summary fetch"
-        )
-        return None
+        msg = f"{debug_prefix} VAPI_API_KEY not set for call_id={call_id}"
+        current_app.logger.warning(msg)
+        return None, msg
 
     url = f"https://api.vapi.ai/call/{call_id}"
     headers = {
@@ -31,34 +38,29 @@ def fetch_call_summary_from_vapi(call_id: str) -> str | None:
     try:
         resp = requests.get(url, headers=headers, timeout=10)
     except requests.exceptions.Timeout:
-        current_app.logger.warning(
-            "fetch_call_summary_from_vapi: request to Vapi timed out for call_id=%s",
-            call_id,
-        )
-        return None
+        msg = f"{debug_prefix} request to Vapi timed out for call_id={call_id}"
+        current_app.logger.warning(msg)
+        return None, msg
     except requests.RequestException:
-        current_app.logger.exception(
-            "fetch_call_summary_from_vapi: request to Vapi failed for call_id=%s",
-            call_id,
-        )
-        return None
+        msg = f"{debug_prefix} request to Vapi failed for call_id={call_id}"
+        current_app.logger.exception(msg)
+        return None, msg
 
     if resp.status_code != 200:
-        current_app.logger.warning(
-            "fetch_call_summary_from_vapi: non-200 (%s) from Vapi for call_id=%s",
-            resp.status_code,
-            call_id,
+        body_snippet = resp.text[:500] if resp.text else ""
+        msg = (
+            f"{debug_prefix} non-200 status from Vapi for call_id={call_id}: "
+            f"status={resp.status_code}, body_snippet={body_snippet!r}"
         )
-        return None
+        current_app.logger.warning(msg)
+        return None, msg
 
     try:
         data = resp.json()
     except ValueError:
-        current_app.logger.exception(
-            "fetch_call_summary_from_vapi: failed to parse JSON for call_id=%s",
-            call_id,
-        )
-        return None
+        msg = f"{debug_prefix} failed to parse JSON from Vapi for call_id={call_id}"
+        current_app.logger.exception(msg)
+        return None, msg
 
     # structuredOutputs is top-level in the payload, but also check under analysis just in case
     analysis = data.get("analysis") or {}
@@ -69,16 +71,36 @@ def fetch_call_summary_from_vapi(call_id: str) -> str | None:
     )
 
     if not isinstance(structured_outputs, dict):
-        return None
+        msg = (
+            f"{debug_prefix} structuredOutputs missing or not a dict "
+            f"in Vapi response for call_id={call_id}; "
+            f"type={type(structured_outputs).__name__}"
+        )
+        current_app.logger.warning(msg)
+        return None, msg
 
     # structured_outputs: { "<uuid>": { "name": "Call Summary", "result": "..." }, ... }
     for so in structured_outputs.values():
         if not isinstance(so, dict):
             continue
         if so.get("name") == "Call Summary":
-            return so.get("result")
+            result = so.get("result")
+            if isinstance(result, str):
+                # Success: real summary
+                return result, None
+            msg = (
+                f"{debug_prefix} 'Call Summary' found but result is not a string "
+                f"for call_id={call_id}; type={type(result).__name__}"
+            )
+            current_app.logger.warning(msg)
+            return None, msg
 
-    return None
+    msg = (
+        f"{debug_prefix} no structured output named 'Call Summary' in Vapi response "
+        f"for call_id={call_id}; keys={list(structured_outputs.keys())}"
+    )
+    current_app.logger.warning(msg)
+    return None, msg
 
 
 @submit_call_bp.route("/submit_call", methods=["POST"])
@@ -196,7 +218,12 @@ def submit_call():
                 break
 
     # 6) Fetch call summary from Vapi (using call_id) with 10s timeout
-    call_summary = fetch_call_summary_from_vapi(call_id)
+    call_summary, summary_debug = fetch_call_summary_from_vapi(call_id)
+
+    # If no real summary, store the debug info in call_summary so it's visible in the DB
+    if call_summary is None and summary_debug:
+        call_summary = summary_debug
+
     current_app.logger.info(
         "submit_call: fetched call_summary=%r for call_id=%s",
         call_summary,
