@@ -9,19 +9,17 @@ from db import get_db_connection
 submit_call_bp = Blueprint("submit_call", __name__)
 
 
-def fetch_call_summary_from_vapi(call_id: str) -> tuple[str | None, str | None]:
+def fetch_call_from_vapi(call_id: str) -> tuple[dict | None, str | None]:
     """
-    Given a Vapi call ID, fetch the call details from Vapi's API
-    and extract the 'Call Summary' structured output if present.
+    Fetch the full call object from Vapi's GET /call/{id} API.
 
     Returns:
-        (summary, debug_info)
+        (call_dict, debug_info)
 
-        - summary: string if a real summary was found, else None
-        - debug_info: string explaining what went wrong (prefixed with
-          '[DEBUG call_summary]') if any issue occurred, else None
+        - call_dict: parsed JSON dict if successful, else None
+        - debug_info: debug string (prefixed with [DEBUG call_api]) if any issue occurred
     """
-    debug_prefix = "[DEBUG call_summary]"
+    debug_prefix = "[DEBUG call_api]"
     vapi_api_key = os.environ.get("VAPI_API_KEY")
 
     if not vapi_api_key:
@@ -37,22 +35,14 @@ def fetch_call_summary_from_vapi(call_id: str) -> tuple[str | None, str | None]:
 
     try:
         resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
     except requests.exceptions.Timeout:
         msg = f"{debug_prefix} request to Vapi timed out for call_id={call_id}"
         current_app.logger.warning(msg)
         return None, msg
-    except requests.RequestException:
-        msg = f"{debug_prefix} request to Vapi failed for call_id={call_id}"
+    except requests.RequestException as e:
+        msg = f"{debug_prefix} request to Vapi failed for call_id={call_id}: {e}"
         current_app.logger.exception(msg)
-        return None, msg
-
-    if resp.status_code != 200:
-        body_snippet = resp.text[:500] if resp.text else ""
-        msg = (
-            f"{debug_prefix} non-200 status from Vapi for call_id={call_id}: "
-            f"status={resp.status_code}, body_snippet={body_snippet!r}"
-        )
-        current_app.logger.warning(msg)
         return None, msg
 
     try:
@@ -62,44 +52,44 @@ def fetch_call_summary_from_vapi(call_id: str) -> tuple[str | None, str | None]:
         current_app.logger.exception(msg)
         return None, msg
 
-    # structuredOutputs is top-level in the payload, but also check under analysis just in case
-    analysis = data.get("analysis") or {}
-    structured_outputs = (
-        analysis.get("structuredOutputs")
-        or data.get("structuredOutputs")
-        or {}
-    )
+    return data, None
 
-    if not isinstance(structured_outputs, dict):
-        msg = (
-            f"{debug_prefix} structuredOutputs missing or not a dict "
-            f"in Vapi response for call_id={call_id}; "
-            f"type={type(structured_outputs).__name__}"
-        )
-        current_app.logger.warning(msg)
-        return None, msg
 
-    # structured_outputs: { "<uuid>": { "name": "Call Summary", "result": "..." }, ... }
-    for so in structured_outputs.values():
-        if not isinstance(so, dict):
-            continue
-        if so.get("name") == "Call Summary":
-            result = so.get("result")
-            if isinstance(result, str):
-                # Success: real summary
-                return result, None
-            msg = (
-                f"{debug_prefix} 'Call Summary' found but result is not a string "
-                f"for call_id={call_id}; type={type(result).__name__}"
-            )
-            current_app.logger.warning(msg)
-            return None, msg
+def extract_summary_from_call(call_data: dict | None, call_id: str) -> tuple[str | None, str | None]:
+    """
+    Given the full call dict from Vapi, pull out the best summary we can.
 
+    Vapi exposes the summary directly as call.summary when
+    analysisPlan.summaryPlan.enabled = true.
+
+    Returns:
+        (summary, debug_info)
+
+        - summary: the actual call summary string, or None if not available
+        - debug_info: explanation if summary is missing/empty
+    """
+    debug_prefix = "[DEBUG call_summary]"
+
+    if call_data is None:
+        # The caller should already have logged why
+        return None, f"{debug_prefix} call_data is None for call_id={call_id}"
+
+    summary = call_data.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip(), None
+
+    # Optional: look inside analysis if Vapi ever puts a summary there
+    analysis = call_data.get("analysis") or {}
+    analysis_summary = analysis.get("summary")
+    if isinstance(analysis_summary, str) and analysis_summary.strip():
+        return analysis_summary.strip(), None
+
+    # If we get here, there really is no useful summary
     msg = (
-        f"{debug_prefix} no structured output named 'Call Summary' in Vapi response "
-        f"for call_id={call_id}; keys={list(structured_outputs.keys())}"
+        f"{debug_prefix} call.summary empty or missing for call_id={call_id} "
+        f"(short or low-content call)"
     )
-    current_app.logger.warning(msg)
+    current_app.logger.info(msg)
     return None, msg
 
 
@@ -108,11 +98,15 @@ def submit_call():
     """
     Vapi webhook for call/tool events.
 
-    We map the important fields into the Calls1 table and keep
-    the rest in JSONB for future-proofing.
+    We:
+      - Validate API key
+      - Parse the incoming event
+      - Extract core call/customer/assistant info
+      - Call Vapi GET /call/{id} to get call.summary
+      - Upsert into Calls1
     """
 
-    # 1) API key auth
+    # 1) API key auth for this webhook
     expected_key = os.environ.get("API_KEY_SECRET")
     auth_header = request.headers.get("Authorization")
 
@@ -126,7 +120,7 @@ def submit_call():
     if token != expected_key:
         return jsonify({"error": "Invalid API key"}), 403
 
-    # 2) Parse JSON
+    # 2) Parse JSON payload
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "Invalid or missing JSON"}), 400
@@ -134,7 +128,7 @@ def submit_call():
     message = data.get("message") or {}
     msg_type = message.get("type")
 
-    # 3) Extract core objects
+    # 3) Extract nested objects
     call_obj = message.get("call") or {}
     phone_number_obj = message.get("phoneNumber") or {}
     customer_obj = message.get("customer") or {}
@@ -145,13 +139,19 @@ def submit_call():
     tool_call_list = message.get("toolCallList") or []
     tool_with_tool_call_list = message.get("toolWithToolCallList") or []
 
-    # 4) Primary ID (Calls1.id) from call.id
+    # 4) Call ID is our primary key
     call_id = call_obj.get("id")
     if not call_id:
         current_app.logger.warning("submit_call: missing call.id, cannot store event")
         return jsonify({"error": "Missing call.id in payload"}), 400
 
-    org_id = call_obj.get("orgId") or assistant_obj.get("orgId") or message.get("orgId")
+    # Org ID
+    org_id = (
+        call_obj.get("orgId")
+        or assistant_obj.get("orgId")
+        or message.get("orgId")
+        or data.get("orgId")
+    )
 
     # Event-level info
     event_timestamp_ms = message.get("timestamp")
@@ -172,7 +172,7 @@ def submit_call():
     phone_call_transport = call_obj.get("phoneCallTransport")
     phone_call_provider_id = call_obj.get("phoneCallProviderId")
 
-    # Customer info
+    # Customer info (fallback to call.customer if top-level missing)
     if not customer_obj:
         customer_obj = call_obj.get("customer") or {}
 
@@ -201,7 +201,7 @@ def submit_call():
     assistant_voice_id = voice_obj.get("voiceId")
     assistant_voice_provider = voice_obj.get("provider")
 
-    # 5) Extract last user / assistant messages from artifact.messages (if present)
+    # 5) Extract the last user and assistant message from artifact.messages (if present)
     last_user_message = None
     last_assistant_message = None
 
@@ -217,27 +217,24 @@ def submit_call():
             if last_user_message is not None and last_assistant_message is not None:
                 break
 
-    # 6) Fetch call summary from Vapi (using call_id) with 10s timeout
-    call_summary, summary_debug = fetch_call_summary_from_vapi(call_id)
+    # 6) Call Vapi /call/{id} to get the summary
+    call_data, call_api_debug = fetch_call_from_vapi(call_id)
+    call_summary, summary_debug = extract_summary_from_call(call_data, call_id)
 
-    # If no real summary, store the debug info in call_summary so it's visible in the DB
-    if call_summary is None and summary_debug:
-        call_summary = summary_debug
-
-    current_app.logger.info(
-        "submit_call: fetched call_summary=%r for call_id=%s",
-        call_summary,
-        call_id,
-    )
+    # If no real summary, store debug info in call_summary so it's visible in the DB
+    if call_summary is None:
+        # Prefer a specific summary_debug, else the call_api_debug if present
+        call_summary = summary_debug or call_api_debug
 
     current_app.logger.info(
-        "submit_call: saving Calls1 row id=%s event_type=%s customer=%s",
+        "submit_call: saving Calls1 row id=%s event_type=%s customer=%s summary=%r",
         call_id,
         event_type,
         customer_number,
+        call_summary,
     )
 
-    # 7) Insert into Calls1
+    # 7) Insert / upsert into Calls1
     conn = get_db_connection()
     try:
         with conn:
