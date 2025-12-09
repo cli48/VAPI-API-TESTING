@@ -15,9 +15,6 @@ def fetch_call_from_vapi(call_id: str) -> tuple[dict | None, str | None]:
 
     Returns:
         (call_dict, debug_info)
-
-        - call_dict: parsed JSON dict if successful, else None
-        - debug_info: debug string (prefixed with [DEBUG call_api]) if any issue occurred
     """
     debug_prefix = "[DEBUG call_api]"
     vapi_api_key = os.environ.get("VAPI_API_KEY")
@@ -57,37 +54,52 @@ def fetch_call_from_vapi(call_id: str) -> tuple[dict | None, str | None]:
 
 def extract_summary_from_call(call_data: dict | None, call_id: str) -> tuple[str | None, str | None]:
     """
-    Given the full call dict from Vapi, pull out the best summary we can.
+    Pull the best possible summary from the Vapi call object.
 
-    Vapi exposes the summary directly as call.summary when
-    analysisPlan.summaryPlan.enabled = true.
+    Priority:
+      1) call.summary (built-in Vapi summary)
+      2) structuredOutputs entry where name == "result"
+      3) analysis.summary (fallback if Vapi moves it there)
 
     Returns:
         (summary, debug_info)
-
-        - summary: the actual call summary string, or None if not available
-        - debug_info: explanation if summary is missing/empty
     """
     debug_prefix = "[DEBUG call_summary]"
 
     if call_data is None:
-        # The caller should already have logged why
         return None, f"{debug_prefix} call_data is None for call_id={call_id}"
 
+    # 1) Built-in Vapi summary
     summary = call_data.get("summary")
     if isinstance(summary, str) and summary.strip():
         return summary.strip(), None
 
-    # Optional: look inside analysis if Vapi ever puts a summary there
+    # 2) Structured output named "result"
+    structured_outputs = (
+        call_data.get("structuredOutputs")
+        or (call_data.get("analysis") or {}).get("structuredOutputs")
+        or {}
+    )
+
+    if isinstance(structured_outputs, dict) and structured_outputs:
+        for so in structured_outputs.values():
+            if not isinstance(so, dict):
+                continue
+            if so.get("name") == "result":
+                result = so.get("result")
+                if isinstance(result, str) and result.strip():
+                    return result.strip(), None
+
+    # 3) analysis.summary fallback
     analysis = call_data.get("analysis") or {}
     analysis_summary = analysis.get("summary")
     if isinstance(analysis_summary, str) and analysis_summary.strip():
         return analysis_summary.strip(), None
 
-    # If we get here, there really is no useful summary
+    # Nothing usable found
     msg = (
-        f"{debug_prefix} call.summary empty or missing for call_id={call_id} "
-        f"(short or low-content call)"
+        f"{debug_prefix} no usable summary found in call.summary or "
+        f"structuredOutputs[name='result'] for call_id={call_id}"
     )
     current_app.logger.info(msg)
     return None, msg
@@ -98,12 +110,12 @@ def submit_call():
     """
     Vapi webhook for call/tool events.
 
-    We:
-      - Validate API key
-      - Parse the incoming event
-      - Extract core call/customer/assistant info
-      - Call Vapi GET /call/{id} to get call.summary
-      - Upsert into Calls1
+    - Validates API key
+    - Parses incoming event
+    - Extracts core info
+    - Calls Vapi GET /call/{id} to get summary
+    - Falls back to transcript-based summary if needed
+    - Upserts into Calls1
     """
 
     # 1) API key auth for this webhook
@@ -201,7 +213,7 @@ def submit_call():
     assistant_voice_id = voice_obj.get("voiceId")
     assistant_voice_provider = voice_obj.get("provider")
 
-    # 5) Extract the last user and assistant message from artifact.messages (if present)
+    # 5) Extract last user / assistant message from artifact.messages
     last_user_message = None
     last_assistant_message = None
 
@@ -221,20 +233,30 @@ def submit_call():
     call_data, call_api_debug = fetch_call_from_vapi(call_id)
     call_summary, summary_debug = extract_summary_from_call(call_data, call_id)
 
-    # If no real summary, store debug info in call_summary so it's visible in the DB
-    if call_summary is None:
-        # Prefer a specific summary_debug, else the call_api_debug if present
-        call_summary = summary_debug or call_api_debug
+    # 7) Fallback summary logic
+    summary_source = "vapi"
+
+    if not call_summary:
+        if last_user_message:
+            call_summary = f"Short call. Caller said: {last_user_message}"
+            summary_source = "fallback:last_user_message"
+        elif last_assistant_message:
+            call_summary = f"Short call. Assistant said: {last_assistant_message}"
+            summary_source = "fallback:last_assistant_message"
+        else:
+            call_summary = summary_debug or call_api_debug
+            summary_source = "debug"
 
     current_app.logger.info(
-        "submit_call: saving Calls1 row id=%s event_type=%s customer=%s summary=%r",
+        "submit_call: saving Calls1 row id=%s event_type=%s customer=%s summary_source=%s summary=%r",
         call_id,
         event_type,
         customer_number,
+        summary_source,
         call_summary,
     )
 
-    # 7) Insert / upsert into Calls1
+    # 8) Insert / upsert into Calls1
     conn = get_db_connection()
     try:
         with conn:
