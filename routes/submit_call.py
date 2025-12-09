@@ -1,8 +1,8 @@
 # routes/submit_call.py
 import os
+import requests
 from flask import Blueprint, request, jsonify, current_app
 from psycopg.types.json import Jsonb
-import requests  # NEW
 
 from db import get_db_connection
 
@@ -13,6 +13,7 @@ def fetch_call_summary_from_vapi(call_id: str) -> str | None:
     """
     Given a Vapi call ID, fetch the call details from Vapi's API
     and extract the 'Call Summary' structured output if present.
+    Times out after 10 seconds to avoid blocking the webhook.
     """
     vapi_api_key = os.environ.get("VAPI_API_KEY")
     if not vapi_api_key:
@@ -29,15 +30,22 @@ def fetch_call_summary_from_vapi(call_id: str) -> str | None:
 
     try:
         resp = requests.get(url, headers=headers, timeout=10)
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        current_app.logger.warning(
+            "fetch_call_summary_from_vapi: request to Vapi timed out for call_id=%s",
+            call_id,
+        )
+        return None
+    except requests.RequestException:
         current_app.logger.exception(
-            "fetch_call_summary_from_vapi: error calling Vapi API for call_id=%s", call_id
+            "fetch_call_summary_from_vapi: request to Vapi failed for call_id=%s",
+            call_id,
         )
         return None
 
     if resp.status_code != 200:
         current_app.logger.warning(
-            "fetch_call_summary_from_vapi: non-200 from Vapi (%s) for call_id=%s",
+            "fetch_call_summary_from_vapi: non-200 (%s) from Vapi for call_id=%s",
             resp.status_code,
             call_id,
         )
@@ -45,17 +53,25 @@ def fetch_call_summary_from_vapi(call_id: str) -> str | None:
 
     try:
         data = resp.json()
-    except Exception:
+    except ValueError:
         current_app.logger.exception(
-            "fetch_call_summary_from_vapi: failed to parse JSON for call_id=%s", call_id
+            "fetch_call_summary_from_vapi: failed to parse JSON for call_id=%s",
+            call_id,
         )
         return None
 
-    # The summary lives in data["analysis"]["structuredOutputs"]
+    # structuredOutputs is top-level in the payload, but also check under analysis just in case
     analysis = data.get("analysis") or {}
-    structured_outputs = analysis.get("structuredOutputs") or {}
+    structured_outputs = (
+        analysis.get("structuredOutputs")
+        or data.get("structuredOutputs")
+        or {}
+    )
 
-    # structured_outputs is a dict keyed by UUID -> { name, result, ... }
+    if not isinstance(structured_outputs, dict):
+        return None
+
+    # structured_outputs: { "<uuid>": { "name": "Call Summary", "result": "..." }, ... }
     for so in structured_outputs.values():
         if not isinstance(so, dict):
             continue
@@ -179,8 +195,13 @@ def submit_call():
             if last_user_message is not None and last_assistant_message is not None:
                 break
 
-    # 6) Fetch call summary from Vapi (using call_id)
+    # 6) Fetch call summary from Vapi (using call_id) with 10s timeout
     call_summary = fetch_call_summary_from_vapi(call_id)
+    current_app.logger.info(
+        "submit_call: fetched call_summary=%r for call_id=%s",
+        call_summary,
+        call_id,
+    )
 
     current_app.logger.info(
         "submit_call: saving Calls1 row id=%s event_type=%s customer=%s",
